@@ -1,6 +1,6 @@
 # concord-builds
 
-Automated Linux `amd64` (GLIBC 2.35+, compatible with Debian 13) builds of [chen08209/concord](https://github.com/chen08209/concord) `main` branch.
+Automated Linux `amd64` (GLIBC 2.35+, compatible with Debian 13) builds of [Vialibrex/concord](https://github.com/Vialibrex/concord) `main` branch.
 
 ## First-Time Setup on GitHub
 

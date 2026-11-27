@@ -34,12 +34,12 @@ jobs:
       - name: Checkout build repository
         uses: actions/checkout@v4
 
-      - name: Check upstream chen08209/concord main commit
+      - name: Check upstream Vialibrex/concord main commit
         id: check
         shell: bash
         run: |
           set -euo pipefail
-          UPSTREAM_SHA=$(git ls-remote https://github.com/chen08209/concord.git refs/heads/main | awk '{print $1}')
+          UPSTREAM_SHA=$(git ls-remote https://github.com/Vialibrex/concord.git refs/heads/main | awk '{print $1}')
           if [ -z "$UPSTREAM_SHA" ]; then
             echo "Failed to resolve upstream HEAD SHA" >&2
             exit 1
@@ -66,7 +66,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth=1 --branch main https://github.com/chen08209/concord.git upstream
+          git clone --depth=1 --branch main https://github.com/Vialibrex/concord.git upstream
           cd upstream
           ACTUAL_SHA=$(git rev-parse HEAD)
           SUBJECT=$(git log -1 --format='%s')
@@ -187,7 +187,7 @@ jobs:
           SHA256=$(awk '{print $1}' dist/concord-linux-amd64.sha256)
           SIZE=$(du -h dist/concord-linux-amd64 | awk '{print $1}')
           {
-            printf 'Automated build of [chen08209/concord](https://github.com/chen08209/concord/commit/%s).\n\n' "$ACTUAL_SHA"
+            printf 'Automated build of [Vialibrex/concord](https://github.com/Vialibrex/concord/commit/%s).\n\n' "$ACTUAL_SHA"
             printf -- '- **Upstream Commit**: `%s` — %s\n' "$SHORT_SHA" "$SUBJECT"
             printf -- '- **Commit Date**: `%s`\n' "$COMMIT_DATE"
             printf -- '- **Built At**: `%s`\n' "$BUILT_AT"
