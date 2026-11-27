@@ -1,0 +1,218 @@
+name: Build Concord (Linux amd64)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-concord.yml'
+  schedule:
+    # Every 6 hours (00:00, 06:00, 12:00, 18:00 UTC => 08:00, 14:00, 20:00, 02:00 CST)
+    - cron: '0 */6 * * *'
+    # Extra run at 20:00 UTC (04:00 CST) right before router's 04:30 CST update timer
+    - cron: '0 20 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force rebuild even if upstream commit has not changed'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-concord
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Ubuntu 22.04 (GLIBC 2.35) guarantees compatibility with Debian 13 (GLIBC 2.41)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout build repository
+        uses: actions/checkout@v4
+
+      - name: Check upstream chen08209/concord main commit
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          UPSTREAM_SHA=$(git ls-remote https://github.com/chen08209/concord.git refs/heads/main | awk '{print $1}')
+          if [ -z "$UPSTREAM_SHA" ]; then
+            echo "Failed to resolve upstream HEAD SHA" >&2
+            exit 1
+          fi
+          LAST_SHA=""
+          if [ -f LAST_COMMIT ]; then
+            LAST_SHA=$(tr -d '[:space:]' < LAST_COMMIT)
+          fi
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${UPSTREAM_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "last_sha=$LAST_SHA" >> "$GITHUB_OUTPUT"
+
+          if [ "$UPSTREAM_SHA" = "$LAST_SHA" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream unchanged at $UPSTREAM_SHA — skipping build."
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "New upstream commit detected: ${LAST_SHA:-none} -> $UPSTREAM_SHA"
+          fi
+
+      - name: Clone upstream source
+        if: steps.check.outputs.should_build == 'true'
+        id: clone
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --branch main https://github.com/chen08209/concord.git upstream
+          cd upstream
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          SUBJECT=$(git log -1 --format='%s')
+          COMMIT_DATE=$(git log -1 --format='%cI')
+          echo "actual_sha=$ACTUAL_SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${ACTUAL_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "subject=$SUBJECT" >> "$GITHUB_OUTPUT"
+          echo "commit_date=$COMMIT_DATE" >> "$GITHUB_OUTPUT"
+          if [ ! -s assets/ca-certificates.crt ]; then
+            mkdir -p assets
+            cp /etc/ssl/certs/ca-certificates.crt assets/ca-certificates.crt
+          fi
+
+      - name: Install native build dependencies
+        if: steps.check.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang libclang-dev cmake pkg-config ca-certificates
+
+      - name: Setup Rust toolchain (matching upstream rust-toolchain.toml)
+        if: steps.check.outputs.should_build == 'true'
+        id: rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHANNEL=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' upstream/rust-toolchain.toml || true)
+          CHANNEL=${CHANNEL:-stable}
+          echo "Installing minimal Rust toolchain: $CHANNEL (x86_64-unknown-linux-gnu only)"
+          rustup toolchain install "$CHANNEL" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$CHANNEL" >> "$GITHUB_ENV"
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Cargo registry and build artifacts
+        if: steps.check.outputs.should_build == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "upstream -> target"
+          key: "concord-linux-amd64-${{ steps.rust.outputs.channel }}"
+
+      - name: Build concord-desktop release binary
+        if: steps.check.outputs.should_build == 'true'
+        shell: bash
+        env:
+          CFLAGS: "-DNDEBUG"
+          CXXFLAGS: "-DNDEBUG"
+        run: |
+          set -euo pipefail
+          cd upstream
+          cargo build --release -p concord-desktop
+          ls -lh target/release/concord
+
+      - name: Package release artifacts
+        if: steps.check.outputs.should_build == 'true'
+        id: pkg
+        shell: bash
+        env:
+          ACTUAL_SHA: ${{ steps.clone.outputs.actual_sha }}
+          SHORT_SHA: ${{ steps.clone.outputs.short_sha }}
+          COMMIT_DATE: ${{ steps.clone.outputs.commit_date }}
+          SUBJECT: ${{ steps.clone.outputs.subject }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp upstream/target/release/concord dist/concord-linux-amd64
+          chmod 755 dist/concord-linux-amd64
+          (cd dist && sha256sum concord-linux-amd64 > concord-linux-amd64.sha256)
+
+          BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          TAG="b-$(date -u +%Y%m%d)-${SHORT_SHA}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            TAG="${TAG}-$(date -u +%H%M%S)"
+          fi
+
+          {
+            printf 'sha=%s\n' "$ACTUAL_SHA"
+            printf 'short=%s\n' "$SHORT_SHA"
+            printf 'tag=%s\n' "$TAG"
+            printf 'built_at=%s\n' "$BUILT_AT"
+            printf 'commit_date=%s\n' "$COMMIT_DATE"
+            printf 'subject=%s\n' "$SUBJECT"
+          } > dist/version.txt
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "built_at=$BUILT_AT" >> "$GITHUB_OUTPUT"
+          cat dist/version.txt
+          cat dist/concord-linux-amd64.sha256
+
+      - name: Record LAST_COMMIT (prevents 60-day schedule auto-disable)
+        if: steps.check.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${{ steps.clone.outputs.actual_sha }}" > LAST_COMMIT
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add LAST_COMMIT
+          if ! git diff --cached --quiet; then
+            git commit -m "build: concord ${{ steps.clone.outputs.short_sha }}"
+            git push
+          fi
+
+      - name: Publish GitHub Release
+        if: steps.check.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTUAL_SHA: ${{ steps.clone.outputs.actual_sha }}
+          SHORT_SHA: ${{ steps.clone.outputs.short_sha }}
+          COMMIT_DATE: ${{ steps.clone.outputs.commit_date }}
+          SUBJECT: ${{ steps.clone.outputs.subject }}
+          TAG: ${{ steps.pkg.outputs.tag }}
+          BUILT_AT: ${{ steps.pkg.outputs.built_at }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA256=$(awk '{print $1}' dist/concord-linux-amd64.sha256)
+          SIZE=$(du -h dist/concord-linux-amd64 | awk '{print $1}')
+          {
+            printf 'Automated build of [chen08209/concord](https://github.com/chen08209/concord/commit/%s).\n\n' "$ACTUAL_SHA"
+            printf -- '- **Upstream Commit**: `%s` — %s\n' "$SHORT_SHA" "$SUBJECT"
+            printf -- '- **Commit Date**: `%s`\n' "$COMMIT_DATE"
+            printf -- '- **Built At**: `%s`\n' "$BUILT_AT"
+            printf -- '- **Platform**: `linux/amd64` (Ubuntu 22.04 / GLIBC 2.35+, compatible with Debian 13)\n'
+            printf -- '- **Size**: `%s`\n' "$SIZE"
+            printf -- '- **SHA-256**: `%s`\n' "$SHA256"
+          } > dist/notes.md
+          gh release create "$TAG" \
+            dist/concord-linux-amd64 \
+            dist/concord-linux-amd64.sha256 \
+            dist/version.txt \
+            --title "concord ${SHORT_SHA} (${TAG})" \
+            --notes-file dist/notes.md \
+            --latest
+
+      - name: Prune old releases (keep latest 15)
+        if: steps.check.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t OLD_TAGS < <(gh release list --limit 100 --json tagName --jq '.[15:][].tagName')
+          for t in "${OLD_TAGS[@]}"; do
+            [ -n "$t" ] || continue
+            echo "Deleting old release: $t"
+            gh release delete "$t" --yes --cleanup-tag || true
+          done
